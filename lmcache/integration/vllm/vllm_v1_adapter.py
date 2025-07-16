@@ -38,6 +38,9 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.lookup_client import LookupClientFactory
+from pathlib import Path
+from vllm.v1.request import Request, RequestStatus
+from vllm.config import get_window_len, get_sd_window, get_prev_sd_window
 
 if TYPE_CHECKING:
     # Third Party
@@ -46,7 +49,8 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import NewRequestData
-    from vllm.v1.request import Request
+    # from vllm.v1.request import Request
+    # from vllm.config import get_window_len, get_sd_window, get_prev_sd_window
 
 logger = init_logger(__name__)
 
@@ -153,6 +157,9 @@ class RequestTracker:
             )
             new_block_ids = new_block_ids[0]
         self.allocated_block_ids.extend(new_block_ids)
+
+    def reset_blk(self) -> None:
+        self.allocated_block_ids = []
 
 
 @dataclass
@@ -365,6 +372,7 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
+        self.sliding_window = get_window_len("/home/zhs/workdir/zhs/vllm_zhs/vllm/zlen.log", 4096)
 
     def _init_kv_caches_from_forward_context(self, forward_context: "ForwardContext"):
         for layer_name in forward_context.no_compile_layers:
@@ -396,6 +404,9 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+
+        sd_window = get_sd_window("/home/zhs/workdir/zhs/vllm_zhs/vllm/zhs.log", 1)
+        prev_sd_window = get_prev_sd_window("/home/zhs/workdir/zhs/vllm_zhs/vllm/zfs.log", sd_window)
 
         if len(self.kv_caches) == 0:
             self._init_kv_caches_from_forward_context(forward_context)
@@ -436,6 +447,9 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            if prev_sd_window > sd_window:
+                lmcache_cached_tokens = cdiv(lmcache_cached_tokens, self._lmcache_chunk_size) * self._lmcache_chunk_size
+
             if self.use_layerwise:
                 sync = True
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
@@ -478,9 +492,12 @@ class LMCacheConnectorV1Impl:
                         "expected number of tokens! This should not happen!"
                     )
                     logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
+                        "Num retrieved tokens: %d, num expected tokens: %d, masked_token_count: %d, vllm_cached_tokens: %d, lmcache_cached_tokens: %d",
                         num_retrieved_tokens,
                         num_expected_tokens,
+                        masked_token_count,
+                        request.load_spec.vllm_cached_tokens,
+                        lmcache_cached_tokens,
                     )
 
     @_lmcache_nvtx_annotate
@@ -579,14 +596,14 @@ class LMCacheConnectorV1Impl:
                 store_mask = torch.ones_like(token_ids, dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
+                # logger.info(
+                #     "Storing KV cache for %d out of %d tokens "
+                #     "(skip_leading_tokens=%d) for request %s",
+                #     len(token_ids) - skip_leading_tokens,
+                #     len(token_ids),
+                #     skip_leading_tokens,
+                #     request.req_id,
+                # )
                 sync = True
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
@@ -660,14 +677,14 @@ class LMCacheConnectorV1Impl:
             store_mask = torch.ones_like(token_ids, dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
 
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
+            # logger.info(
+            #     "Storing KV cache for %d out of %d tokens "
+            #     "(skip_leading_tokens=%d) for request %s",
+            #     len(token_ids) - skip_leading_tokens,
+            #     len(token_ids),
+            #     skip_leading_tokens,
+            #     request.req_id,
+            # )
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -711,7 +728,10 @@ class LMCacheConnectorV1Impl:
         ):
             return 0
 
-        token_ids = torch.tensor(request.prompt_token_ids)
+        if request.status == RequestStatus.RUNNING:
+            token_ids = torch.tensor(request._all_token_ids)
+        else:
+            token_ids = torch.tensor(request.prompt_token_ids)
 
         # If the request has multimodal hashes, apply them to the token ids
         if request.mm_hashes:
@@ -726,6 +746,13 @@ class LMCacheConnectorV1Impl:
         else:
             num_external_hit_tokens = self.lookup_client.lookup(token_ids)
 
+        origin_hit_tokens = num_external_hit_tokens
+
+        if request.status == RequestStatus.RUNNING:
+            prev_window_len = self.sliding_window // request.sd_prev_window
+            num_external_hit_tokens = min(num_external_hit_tokens, request.num_computed_tokens - prev_window_len)
+
+
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
@@ -736,13 +763,27 @@ class LMCacheConnectorV1Impl:
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
 
-        logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
-            request.request_id,
-            request.num_tokens,
-            num_external_hit_tokens,
-            need_to_allocate,
-        )
+
+
+        # logger.info(
+        #     "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+        #     request.request_id,
+        #     request.num_tokens,
+        #     num_external_hit_tokens,
+        #     need_to_allocate,
+        # )
+        if request.status == RequestStatus.RUNNING:
+            logger.info(
+                "ZHS Reqid: %s, Total tokens %d, LMCache hit tokens: %d, vLLM Cache tokens: %d, need to load: %d, prev_window: %d, origin_hit_tokens: %d ",
+                request.request_id,
+                request.num_tokens,
+                num_external_hit_tokens,
+                num_computed_tokens,
+                need_to_allocate,
+                prev_window_len,
+                origin_hit_tokens,
+            )
+
         if need_to_allocate <= 0:
             return 0
 
@@ -814,6 +855,8 @@ class LMCacheConnectorV1Impl:
         force_skip_save = self.kv_role == "kv_consumer"
 
         meta = LMCacheConnectorMetadata()
+        sd_window = get_sd_window("/home/zhs/workdir/zhs/vllm_zhs/vllm/zhs.log", 1)
+        prev_sd_window = get_prev_sd_window("/home/zhs/workdir/zhs/vllm_zhs/vllm/zfs.log", sd_window)
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -854,13 +897,21 @@ class LMCacheConnectorV1Impl:
         if isinstance(cached_reqs, list):
             for i, req in enumerate(cached_reqs):
                 request_tracker = self._request_trackers[req.req_id]
+                
+                if prev_sd_window > sd_window:
+                    request_tracker.reset_blk()
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
+
+                if prev_sd_window > sd_window:
+                    load_spec = self.load_specs.pop(req.req_id, None)
+                else:
+                    load_spec = None
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
                     self._lmcache_chunk_size,
-                    load_spec=None,
+                    load_spec=load_spec,
                     skip_save=force_skip_save,
                     discard_partial_chunks=self._discard_partial_chunks,
                 )

@@ -223,17 +223,29 @@ class LMCacheEngine:
         if self.lookup_server is not None:
             self.lookup_server.batched_insert(keys)
 
-        logger.info(
-            "Stored %d out of total %d tokens. size: %.4f gb, cost %.4f ms, "
-            "throughput: %.4f GB/s; offload_time: %.4f ms, put_time: %.4f ms",
-            tot_token_num,
-            len(tokens),
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3,
-            offload_time * 1000,
-            put_time * 1000,
-        )
+        # logger.info(
+        #     "Stored %d out of total %d tokens. size: %.4f gb, cost %.4f ms, "
+        #     "throughput: %.4f GB/s; offload_time: %.4f ms, put_time: %.4f ms",
+        #     tot_token_num,
+        #     len(tokens),
+        #     tot_kv_size / 1024**3,
+        #     tot_time * 1000,
+        #     tot_kv_size / tot_time / 1024**3,
+        #     offload_time * 1000,
+        #     put_time * 1000,
+        # )
+        skip_tokens_num = len(tokens) - num_to_store_tokens
+
+        if tot_token_num != 256 and tot_token_num <5000:
+            logger.info(
+                "ZHS Total tokens %d, Store tot_token_num %d, size: %.4f gb"
+                "num_to_store_tokens: %d, skip_tokens_num: %d",
+                len(tokens),
+                tot_token_num,
+                tot_kv_size / 1024**3,
+                num_to_store_tokens,
+                skip_tokens_num,
+            )
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
 
@@ -401,9 +413,11 @@ class LMCacheEngine:
                 # NOTE: key should always be in the lookup cache once
                 # we support it.
                 location = self.storage_manager.contains(key)
+                # logger.info("Out of Key, Start is %d. End is %d", start, end)
                 if location is None:
                     # TODO(Jiayi): Need to refactor P2P as a storage backend to
                     # clean up the following code.
+                    logger.info("Out of Key, Start is %d. End is %d", start, end)
                     if self.enable_p2p:
                         future_memory_obj = asyncio.run_coroutine_threadsafe(
                             self.distributed_server.issue_get(key),
