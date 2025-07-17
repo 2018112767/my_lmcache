@@ -238,7 +238,7 @@ class LMCacheEngine:
 
         if tot_token_num != 256 and tot_token_num <5000:
             logger.info(
-                "ZHS Total tokens %d, Store tot_token_num %d, size: %.4f gb"
+                "ZHS Total tokens %d, Store tot_token_num %d, size: %.4f gb, "
                 "num_to_store_tokens: %d, skip_tokens_num: %d",
                 len(tokens),
                 tot_token_num,
@@ -402,6 +402,8 @@ class LMCacheEngine:
         reordered_memory_objs = []
         reordered_starts = []
         reordered_ends = []
+
+        # ZHS todo. 修改process_tokens以支持多段回填？
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
 

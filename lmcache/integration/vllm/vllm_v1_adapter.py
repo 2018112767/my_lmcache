@@ -256,6 +256,7 @@ class ReqMeta:
             )
 
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
+        # ZHS 广播加法
         slot_mapping = (
             block_offsets.reshape((1, block_size))
             + block_ids.reshape((num_blocks, 1)) * block_size
@@ -447,6 +448,8 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+
+            # ZHS 补全上界，因为lmcache存储的是完整的chunk的hash (window_size 必须大于 chunk_size)
             if prev_sd_window > sd_window:
                 lmcache_cached_tokens = cdiv(lmcache_cached_tokens, self._lmcache_chunk_size) * self._lmcache_chunk_size
 
@@ -748,6 +751,9 @@ class LMCacheConnectorV1Impl:
 
         origin_hit_tokens = num_external_hit_tokens
 
+        # ZHS 
+        # origin_hit_tokens: LMCache中命中的token数
+        # request.num_computed_tokens - prev_window_len： 旧的窗口下界，之后的token仍在显存中
         if request.status == RequestStatus.RUNNING:
             prev_window_len = self.sliding_window // request.sd_prev_window
             num_external_hit_tokens = min(num_external_hit_tokens, request.num_computed_tokens - prev_window_len)
@@ -898,6 +904,7 @@ class LMCacheConnectorV1Impl:
             for i, req in enumerate(cached_reqs):
                 request_tracker = self._request_trackers[req.req_id]
                 
+                # ZHS 直接重置block_ids序列
                 if prev_sd_window > sd_window:
                     request_tracker.reset_blk()
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
